@@ -28,6 +28,13 @@ config_file="config.ini"
 eSim_Home=`pwd`
 ngspiceFlag=0
 
+# Ubuntu release. The dispatcher exports UBUNTU_VER; fall back to os-release so
+# that this profile also works standalone and does not need lsb_release.
+if [ -z "${UBUNTU_VER:-}" ]; then
+    UBUNTU_VER="$( . /etc/os-release 2>/dev/null; printf '%s' "${VERSION_ID:-}" )" || true
+fi
+export UBUNTU_VER
+
 ## All Functions goes here
 
 error_exit()
@@ -45,9 +52,11 @@ function createConfigFile
     # Creating config.ini file and adding configuration information
     # Check if config file is present
     if [ -d $config_dir ];then
-        rm $config_dir/$config_file && touch $config_dir/$config_file
+        # -f: a re-install finds the directory but may not find config.ini, and
+        # a failing `rm` aborted the installation under `set -e`.
+        rm -f $config_dir/$config_file && touch $config_dir/$config_file
     else
-        mkdir $config_dir && touch $config_dir/$config_file
+        mkdir -p $config_dir && touch $config_dir/$config_file
     fi
     
     echo "[eSim]" >> $config_dir/$config_file
@@ -133,8 +142,8 @@ function installKicad
 {
     echo "Installing KiCad..........................."
 
-    # Detect Ubuntu version
-    ubuntu_version=$(lsb_release -rs)
+    # Detect Ubuntu version (lsb_release is not installed on minimal images)
+    ubuntu_version="${UBUNTU_VER:-$(lsb_release -rs 2>/dev/null)}"
 
     # Define KiCad PPAs based on Ubuntu version
     if [[ "$ubuntu_version" == "24.04" ]]; then
@@ -157,8 +166,10 @@ function installKicad
                     exit 1
                 fi
             else
-                echo "KiCad 8.0 is already installed."
-                exit 0
+                echo "KiCad $installed_version is already installed."
+                # Was `exit 0`: it aborted the whole installation before eSim
+                # itself was installed, so a re-run could never complete.
+                return 0
             fi
         fi
 
@@ -196,9 +207,11 @@ function installDependency
     trap error_exit ERR
     
     echo "Instaling virtualenv......................."
-    sudo apt install python3-virtualenv
+    # -y: without it apt asked for confirmation and unattended runs aborted.
+    sudo apt install -y python3-virtualenv
    
     echo "Creating virtual environment to isolate packages "
+    rm -rf $config_dir/env
     virtualenv $config_dir/env
     
     echo "Starting the virtual env..................."
@@ -260,15 +273,25 @@ function copyKicadLibrary
     #Extract custom KiCad Library
     tar -xJf library/kicadLibrary.tar.xz
 
-    if [ -d ~/.config/kicad/6.0 ];then
-        echo "kicad config folder already exists"
+    # Detect the installed KiCad version instead of hardcoding 6.0: the symbol
+    # table was written to ~/.config/kicad/6.0 even with KiCad 8 installed, so
+    # eSim's symbols never appeared in KiCad's symbol chooser.
+    kicad_cfg_root="$HOME/.config/kicad"
+    kicad_tag="$(ls -1 "$kicad_cfg_root" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)"
+    if [ -z "$kicad_tag" ]; then
+        kicad_tag="$(dpkg-query -W -f='${Version}' kicad 2>/dev/null | grep -oE '^[0-9]+\.[0-9]+' || true)"
+    fi
+    [ -n "$kicad_tag" ] || kicad_tag="8.0"
+
+    if [ -d "$kicad_cfg_root/$kicad_tag" ];then
+        echo "kicad config folder $kicad_cfg_root/$kicad_tag already exists"
     else 
-        echo ".config/kicad/6.0 does not exist"
-        mkdir -p ~/.config/kicad/6.0
+        echo "$kicad_cfg_root/$kicad_tag does not exist"
+        mkdir -p "$kicad_cfg_root/$kicad_tag"
     fi
 
     # Copy symbol table for eSim custom symbols 
-    cp kicadLibrary/template/sym-lib-table ~/.config/kicad/6.0/
+    cp kicadLibrary/template/sym-lib-table "$kicad_cfg_root/$kicad_tag/"
     echo "symbol table copied in the directory"
 
     # Copy KiCad symbols made for eSim
